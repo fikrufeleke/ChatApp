@@ -1,0 +1,514 @@
+/*
+*
+* A simple linux comand line chat application
+* Author: Fikru Feleke and Habtamu Kumera
+*
+*/
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdbool.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <pthread.h>
+
+#include "chat_utils.h"
+
+#define MAX_CLIENTS 30
+#define MAX_ROOMS 10
+#define MAX_RECORDS 10000
+
+char *rooms[MAX_ROOMS]; 	// chatroom names
+int nrooms;					// number of chatrooms	
+user users[MAX_RECORDS];	// users loaded to ram
+int nusers;					// number of users loaded to ram
+
+/* server side procedures */
+void initialize_server(connection_info*, int);
+void accept_connection(connection_info*, connection_info*);
+void close_server(connection_info*);
+int proc_login(connection_info*, int, chat_msg_protocol);
+int proc_registration(connection_info*, int, chat_msg_protocol);
+int proc_join(connection_info*, int, chat_msg_protocol);
+void proc_new_chatroom(connection_info *, int, chat_msg_protocol);
+void proc_public_msg(connection_info[], int, char*);
+void proc_private_msg(connection_info[], int, char*, char*);
+void send_users(connection_info *, int);
+void send_user_full_message(int);
+void send_user_status(connection_info *, int , msg_type);
+int make_fd_set(fd_set*, connection_info*, connection_info*);
+void handle_client_message(connection_info*, int);
+void handle_user_input(connection_info *);
+void load_users();
+
+
+int main(int argc, char *argv[])
+{
+	puts("Starting server.");
+	fd_set file_descriptors;
+	connection_info server_info;
+	connection_info clients[MAX_CLIENTS];
+	rooms[0] = "GLOBAL" ;					//default chatroom
+	nrooms=1;
+	
+	for(int i = 0; i < MAX_CLIENTS; i++)
+	{
+		clients[i].socket = 0;
+		clients[i].login = 0;
+	}
+		
+	if (argc != 2)
+	{
+		fprintf(stderr, "Usage: %s <port>\n", argv[0]);
+		exit(1);
+	}
+
+	initialize_server(&server_info, atoi(argv[1]));
+	load_users();
+	
+	while(true)
+	{
+		int max_fd = make_fd_set(&file_descriptors, &server_info, clients);
+
+		if(select(max_fd+1, &file_descriptors, NULL, NULL, NULL) < 0)
+		{
+			perror("Select Failed");
+			close_server(clients);
+		}
+
+		if(FD_ISSET(STDIN_FILENO, &file_descriptors))
+		{
+			handle_user_input(clients);
+		}
+
+		if(FD_ISSET(server_info.socket, &file_descriptors))
+		{
+			accept_connection(&server_info, clients);
+		}
+
+		for(int i = 0; i < MAX_CLIENTS; i++)
+		{
+			if(clients[i].socket > 0 && FD_ISSET(clients[i].socket, &file_descriptors))
+			{
+				handle_client_message(clients, i);
+			}
+		}
+	}
+
+	return 0;
+}
+
+void initialize_server(connection_info *server_info, int port)
+{
+	/* create socket */
+	if((server_info->socket = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+	{
+		perror("Failed to create socket");
+		exit(1);
+	}
+
+	server_info->address.sin_family = AF_INET;
+	server_info->address.sin_addr.s_addr = INADDR_ANY;
+	server_info->address.sin_port = htons(port);
+	/* bind socket */
+	if(bind(server_info->socket, (struct sockaddr *)&server_info->address, sizeof(server_info->address)) < 0)
+	{
+		perror("Binding failed");
+		exit(1);
+	}
+
+	const int optVal = 1;
+	const socklen_t optLen = sizeof(optVal);
+	if(setsockopt(server_info->socket, SOL_SOCKET, SO_REUSEADDR, (void*) &optVal, optLen) < 0)
+	{
+		perror("Set socket option failed");
+		exit(1);
+	}
+	/* listen for connection */
+	if(listen(server_info->socket, 3) < 0) {
+		perror("Listen failed");
+		exit(1);
+	}
+
+	printf("Waiting for incoming connections...\n");
+}
+
+int make_fd_set(fd_set *set, connection_info *server_info, connection_info *clients)
+{
+	FD_ZERO(set);
+	FD_SET(STDIN_FILENO, set);
+	FD_SET(server_info->socket, set);
+
+	int max_fd = server_info->socket;
+	for(int i = 0; i < MAX_CLIENTS; i++)
+	{
+		if(clients[i].socket > 0)
+		{
+			FD_SET(clients[i].socket, set);
+		  
+			if(clients[i].socket > max_fd)
+			{
+				max_fd = clients[i].socket;
+			}
+		}
+	}
+	return max_fd;
+}
+
+void load_users()
+{
+ 	FILE *regfile=fopen("reg.txt", "r");
+ 	char line[50] ;
+	int i = 0;
+	while (fgets(line, sizeof(line), regfile)!= NULL && i < MAX_RECORDS)
+	{
+		strncpy(users[i].username, strtok (line, ","), 20);      
+		strncpy(users[i].password, strtok (NULL, "\n"), 20);   
+		i++;	
+	}
+	fclose(regfile);
+	nusers = i;
+	// if (nusers == MAX_RECORDS) clean_inactive_users()   	
+}
+
+int proc_login(connection_info *clients, int sender, chat_msg_protocol msg)
+{
+	for(int i = 0;i < nusers; i++)
+	{
+		if(strcmp(msg.username, users[i].username) == 0 && strcmp(msg.password, users[i].password) == 0)
+		{
+			clients[sender].login = 1;
+			strncpy(clients[sender].username, msg.username, 20);
+			// assign default room
+			strcpy(clients[sender].chatroom_name, "GLOBAL");
+			// send login message to users
+			send_user_status(clients, sender, LOGIN_SUCCESS);
+			return 1; 
+		}
+	}
+		
+	msg.type=LOGIN_ERROR;
+	if(send(clients[sender].socket, &msg, sizeof(msg), 0) < 0)
+	{
+		perror("Send failed");
+		exit(1);
+	}
+	return 0;
+	 
+}
+
+int proc_registration(connection_info* clients, int sender, chat_msg_protocol msg)
+{
+	for(int i = 0; i < nusers; i++)
+	{
+		if(strcmp(msg.username, users[i].username) == 0)
+		{
+			msg.type=REGISTER_ERROR;
+			if(send(clients[sender].socket, &msg, sizeof(msg), 0) < 0)
+			{
+				perror("Send failed");
+				exit(1);
+			}
+			return 0; 
+		}
+	}
+	FILE *regfile=fopen("reg.txt", "a");
+	fprintf(regfile, "%s,%s\n", msg.username, msg.password);
+	fclose(regfile);
+	
+	strncpy(users[nusers].username, msg.username, 20);
+	strncpy(users[nusers].password, msg.password, 20);
+	nusers++;
+	proc_login(clients, sender, msg);
+	return 1;
+	 
+}
+
+int proc_join(connection_info *clients, int sender, chat_msg_protocol msg)
+{
+	if (!clients[sender].login) 
+	{
+		msg.type = LOGIN;
+		if(send(clients[sender].socket, &msg, sizeof(msg), 0) < 0)
+		{
+			perror("Send failed");
+			exit(1);
+		}
+		return 0;
+	}
+	for(int i=0;i < nrooms;i++)
+	{
+		if(strcmp(msg.chatroom_name, rooms[i]) == 0) 
+		{
+			strncpy(clients[sender].chatroom_name, msg.chatroom_name, 20);
+			//send join message to users
+			send_user_status(clients, sender, JOIN_SUCCESS);
+			return 1;
+		}
+	}
+	msg.type = RNAME_ERROR;
+	if(send(clients[sender].socket, &msg, sizeof(msg), 0) < 0)
+	{
+		perror("Send failed");
+		exit(1);
+	}
+	return 0;		
+		
+}
+
+void proc_new_chatroom(connection_info *clients, int sender, chat_msg_protocol msg) 
+{
+	if( nrooms < MAX_ROOMS) 
+	{
+		for(int i=0; i < nrooms; i++)
+		{
+			if(strcmp(rooms[i], msg.chatroom_name)== 0) return; 
+		}
+		rooms[nrooms]= msg.chatroom_name;
+		nrooms++;
+	}
+	else 
+	{
+		msg.type = ROOMS_FULL;
+		if(send(clients[sender].socket, &msg, sizeof(msg), 0) < 0)
+		{
+			perror("Send failed");
+			exit(1);
+		}
+	}
+}
+
+void proc_public_msg(connection_info clients[], int sender, char *message_text)
+{
+	chat_msg_protocol msg;	
+	if (!clients[sender].login) 
+	{
+		msg.type = LOGIN;
+		if(send(clients[sender].socket, &msg, sizeof(msg), 0) < 0)
+		{
+			perror("Send failed");
+			exit(1);
+		}
+		return ;
+	}
+	
+	msg.type = PUBLIC_MESSAGE;
+	strncpy(msg.username, clients[sender].username, 20);
+	strncpy(msg.data, message_text, 256);
+	for(int i = 0; i < MAX_CLIENTS; i++)
+	{
+		if(clients[i].socket != 0 && strcmp(clients[i].chatroom_name, clients[sender].chatroom_name)== 0 && i != sender )
+		{
+			if(send(clients[i].socket, &msg, sizeof(msg), 0) < 0)
+			{
+				perror("Send failed");
+				exit(1);
+			}
+		}
+	}
+}
+
+void proc_private_msg(connection_info clients[], int sender, char *touser, char *message_text)
+{
+	chat_msg_protocol msg;	
+	if (!clients[sender].login) 
+	{
+		msg.type = LOGIN;
+		if(send(clients[sender].socket, &msg, sizeof(msg), 0) < 0)
+		{
+			perror("Send failed");
+			exit(1);
+		}
+		return ;
+	}	
+ 
+	msg.type = PRIVATE_MESSAGE;
+	strncpy(msg.username, clients[sender].username, 20);
+	strncpy(msg.data, message_text, 256);
+
+	for(int i = 0; i < MAX_CLIENTS; i++)
+	{
+		if(i != sender && clients[i].socket != 0 && strcmp(clients[i].username, touser) == 0)
+		{
+			if(send(clients[i].socket, &msg, sizeof(msg), 0) < 0)
+			{
+				perror("Send failed");
+				exit(1);
+			}
+		return;
+		}
+	}
+
+	msg.type = USERNAME_ERROR;
+
+	if(send(clients[sender].socket, &msg, sizeof(msg), 0) < 0)
+	{
+		perror("Send failed");
+		exit(1);
+	}
+
+}
+
+void send_user_status(connection_info *clients, int sender, msg_type msg_t)
+{
+	chat_msg_protocol msg;
+	msg.type = msg_t;
+	strncpy(msg.username, clients[sender].username, 21);
+	strncpy(msg.chatroom_name, clients[sender].chatroom_name, 21);
+	for(int i = 0; i < MAX_CLIENTS; i++)
+	{
+		if(clients[i].socket != 0)
+		{
+			if(send(clients[i].socket, &msg, sizeof(msg), 0) < 0)
+			{
+				perror("Send failed");
+				exit(1);
+			}
+		}
+	}
+}
+
+void send_users(connection_info *clients, int receiver) 
+{
+	chat_msg_protocol msg;
+	msg.type = GET_USERS;
+	char *list = msg.data;
+	for(int i = 0; i < MAX_CLIENTS; i++)
+	{
+		if(clients[i].socket != 0)
+		{
+			list = stpcpy(list, clients[i].username);
+			list = stpcpy(list, ", In room: ");
+			list = stpcpy(list, clients[i].chatroom_name); 	
+			list = stpcpy(list, "\n");
+		}
+	}
+
+	if(send(clients[receiver].socket, &msg, sizeof(msg), 0) < 0)
+	{
+		perror("Send failed");
+		exit(1);
+	}
+
+}
+
+void send_user_full_message(int socket)
+{
+	chat_msg_protocol too_full;
+	too_full.type = USERS_FULL;
+
+	if(send(socket, &too_full, sizeof(too_full), 0) < 0)
+	{
+		perror("Send failed");
+		exit(1);
+	}
+
+	close(socket);
+}
+
+//close all the sockets before exiting
+void close_server(connection_info *clients)
+{
+	for(int i = 0; i < MAX_CLIENTS; i++)
+	{
+   		close(clients[i].socket);
+	}
+	exit(0);
+}
+
+void handle_client_message(connection_info *clients, int sender)
+{
+	int read_size;
+	chat_msg_protocol msg;
+
+	if((read_size = recv(clients[sender].socket, &msg, sizeof(chat_msg_protocol), 0)) == 0)
+	{
+		printf("User disconnected: %s.\n", clients[sender].username);
+		send_user_status(clients, sender, DISCONNECT);
+		close(clients[sender].socket);
+		// release space for new connection 
+		clients[sender].socket = 0;
+	
+  } else {
+
+    switch(msg.type)
+    {
+		case GET_USERS:
+			send_users(clients, sender);
+		break;
+
+		case LOGIN:                
+			proc_login(clients, sender, msg);
+		break;
+	  
+		case JOIN:
+			proc_join(clients, sender, msg) ; 
+		break;
+		
+		case NEW_CHATROOM:
+			proc_new_chatroom(clients, sender, msg) ;
+		break;
+		
+		case REGISTER:
+			proc_registration(clients, sender, msg);
+		break;
+     
+		case PUBLIC_MESSAGE:
+			proc_public_msg(clients, sender, msg.data);
+		break;
+
+		case PRIVATE_MESSAGE:
+			proc_private_msg(clients, sender, msg.username, msg.data);
+		break;
+
+		default:
+			fprintf(stderr, "Unknown message type received.\n");
+		break;
+    }
+  }
+}
+
+void accept_connection(connection_info *server_info, connection_info *clients)
+{
+  int new_socket;
+  int address_len;
+  new_socket = accept(server_info->socket, (struct sockaddr*)&server_info->address, (socklen_t*)&address_len);
+
+  if (new_socket < 0)
+  {
+    perror("Accept Failed");
+    exit(1);
+  }
+
+  for(int i = 0; i < MAX_CLIENTS; i++)
+  {
+    if(clients[i].socket == 0) {
+      clients[i].socket = new_socket;
+
+      break;
+
+    } else if (i == MAX_CLIENTS -1) 
+    {
+      send_user_full_message(new_socket);
+    }
+  }
+}
+
+void handle_user_input(connection_info *clients)
+{
+	char input[255];
+	fgets(input, sizeof(input), stdin);
+	trim_newline(input);
+
+	if(input[0] == 'q') {
+		close_server(clients);
+	}
+}
+
+
+
+
